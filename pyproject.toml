@@ -1,0 +1,15 @@
+[project]
+name = "mploader"
+version = "0.1.0"
+description = "YouTube to JioSaavn Music Downloader"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "yt-dlp>=2024.12.13",
+    "requests>=2.31.0",
+    "mutagen>=1.47.0",
+    "pydub>=0.25.1",
+]
+
+[project.scripts]
+mploader = "mploader:main"
