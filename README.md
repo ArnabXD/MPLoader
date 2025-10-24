@@ -47,16 +47,6 @@ uv run mploader.py "YOUTUBE_URL" -o ~/Music -w 5 -v
 - `-w` Parallel workers (default: `3`)
 - `-v` Verbose logging
 
-## Cleaning Unwanted Files
-
-```bash
-# Preview
-find downloads -type f -name "*.mp3" | grep -iE '(lofi|cover|remix|acoustic|live)'
-
-# Delete
-find downloads -type f -name "*.mp3" | grep -iE '(lofi|cover|remix|acoustic|live)' | xargs rm
-```
-
 ## License
 
 MIT License
