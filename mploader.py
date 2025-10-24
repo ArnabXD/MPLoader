@@ -12,19 +12,24 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import yt_dlp
 import requests
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, TDRC
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, TDRC, TPE2, TCON, TCOM, TPUB, COMM, USLT, TRCK
 from pydub import AudioSegment
 
-# Setup logging
+# Setup logging with thread safety
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - [%(threadName)s] - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Thread-safe print lock
+print_lock = threading.Lock()
 
 
 class JioSaavnAPI:
@@ -212,7 +217,7 @@ class MusicDownloader:
             return False
 
     def add_metadata(self, file_path: Path, metadata: Dict) -> bool:
-        """Add ID3 metadata to MP3 file"""
+        """Add comprehensive ID3 metadata to MP3 file"""
         try:
             audio = MP3(str(file_path), ID3=ID3)
 
@@ -222,7 +227,7 @@ class MusicDownloader:
             except:
                 pass
 
-            # Add metadata
+            # Basic metadata
             if metadata.get('title'):
                 audio.tags.add(TIT2(encoding=3, text=metadata['title']))
 
@@ -234,6 +239,36 @@ class MusicDownloader:
 
             if metadata.get('year'):
                 audio.tags.add(TDRC(encoding=3, text=str(metadata['year'])))
+
+            # Album artist
+            if metadata.get('album_artist'):
+                audio.tags.add(TPE2(encoding=3, text=metadata['album_artist']))
+
+            # Genre/Language
+            if metadata.get('language'):
+                audio.tags.add(TCON(encoding=3, text=metadata['language'].title()))
+
+            # Composers/Lyricists
+            if metadata.get('composers'):
+                audio.tags.add(TCOM(encoding=3, text=metadata['composers']))
+
+            # Publisher/Label
+            if metadata.get('label'):
+                audio.tags.add(TPUB(encoding=3, text=metadata['label']))
+
+            # Copyright
+            if metadata.get('copyright'):
+                audio.tags.add(COMM(encoding=3, lang='eng', desc='Copyright', text=metadata['copyright']))
+
+            # URL
+            if metadata.get('url'):
+                audio.tags.add(COMM(encoding=3, lang='eng', desc='URL', text=metadata['url']))
+
+            # Duration comment
+            if metadata.get('duration'):
+                minutes = metadata['duration'] // 60
+                seconds = metadata['duration'] % 60
+                audio.tags.add(COMM(encoding=3, lang='eng', desc='Duration', text=f"{minutes}:{seconds:02d}"))
 
             # Add album art if available
             if metadata.get('image_url'):
@@ -340,7 +375,7 @@ class MusicDownloader:
             # Clean up temp file
             temp_file.unlink(missing_ok=True)
 
-            # Add metadata
+            # Add comprehensive metadata
             # Get image URL - prefer highest quality
             images = song_details.get('image', [])
             image_url = None
@@ -352,12 +387,24 @@ class MusicDownloader:
                 if not image_url:
                     image_url = images[-1].get('url')  # Fallback to last (usually highest)
 
+            # Get all artists for composers
+            all_artists = song_details.get('artists', {}).get('all', [])
+            composers = ', '.join([a.get('name', '') for a in all_artists if a.get('role') == 'lyricist'])
+            album_artists = ', '.join([a.get('name', '') for a in all_artists if a.get('role') in ['music', 'composer']])
+
             metadata = {
                 'title': song_details.get('name'),
                 'artist': artist_names,
                 'album': song_details.get('album', {}).get('name') if isinstance(song_details.get('album'), dict) else song_details.get('album'),
                 'year': song_details.get('year'),
-                'image_url': image_url
+                'image_url': image_url,
+                'album_artist': album_artists if album_artists else artist_names,
+                'language': song_details.get('language'),
+                'composers': composers if composers else None,
+                'label': song_details.get('label'),
+                'copyright': song_details.get('copyright'),
+                'url': song_details.get('url'),
+                'duration': song_details.get('duration')
             }
             self.add_metadata(output_file, metadata)
 
@@ -368,8 +415,8 @@ class MusicDownloader:
             logger.error(f"Error processing track: {e}")
             return False
 
-    def process_url(self, url: str) -> None:
-        """Process YouTube URL (video or playlist)"""
+    def process_url(self, url: str, max_workers: int = 3) -> None:
+        """Process YouTube URL (video or playlist) with multi-threading"""
         logger.info(f"Extracting metadata from: {url}")
 
         tracks = self.youtube.extract_metadata(url)
@@ -377,15 +424,66 @@ class MusicDownloader:
             logger.error("Could not extract any tracks")
             return
 
-        logger.info(f"Processing {len(tracks)} track(s)")
+        total_tracks = len(tracks)
+        logger.info(f"Processing {total_tracks} track(s) with {max_workers} parallel workers")
 
         success_count = 0
-        for i, track in enumerate(tracks, 1):
-            logger.info(f"\n[{i}/{len(tracks)}] Processing track...")
-            if self.process_track(track):
-                success_count += 1
+        failed_tracks = []
+        cancelled_tracks = []
 
-        logger.info(f"\nCompleted: {success_count}/{len(tracks)} tracks successfully processed")
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="Worker") as executor:
+            # Submit all tracks for processing
+            future_to_track = {
+                executor.submit(self.process_track, track): (i, track)
+                for i, track in enumerate(tracks, 1)
+            }
+
+            # Process completed tasks as they finish
+            try:
+                for future in as_completed(future_to_track):
+                    track_num, track = future_to_track[future]
+                    try:
+                        if future.result():
+                            success_count += 1
+                            logger.info(f"[{success_count}/{total_tracks}] Completed successfully")
+                        else:
+                            failed_tracks.append(track.get('title', 'Unknown'))
+                            logger.warning(f"[{track_num}/{total_tracks}] Failed to process")
+                    except Exception as e:
+                        failed_tracks.append(track.get('title', 'Unknown'))
+                        logger.error(f"[{track_num}/{total_tracks}] Exception occurred: {e}")
+            except KeyboardInterrupt:
+                logger.info("\n\nReceived Ctrl+C! Gracefully shutting down...")
+                logger.info("Finishing current downloads, cancelling pending tasks...")
+
+                # Cancel only pending futures (not running ones)
+                for future in future_to_track:
+                    if not future.running() and not future.done():
+                        if future.cancel():
+                            track_num, track = future_to_track[future]
+                            cancelled_tracks.append(track.get('title', 'Unknown'))
+
+                logger.info(f"Cancelled {len(cancelled_tracks)} pending tasks")
+                logger.info("Waiting for running tasks to complete...")
+                raise
+
+        # Summary
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Download Summary:")
+        logger.info(f"Total: {total_tracks} | Success: {success_count} | Failed: {len(failed_tracks)} | Cancelled: {len(cancelled_tracks)}")
+
+        if failed_tracks:
+            logger.info(f"\nFailed tracks:")
+            for track in failed_tracks:
+                logger.info(f"  - {track}")
+
+        if cancelled_tracks:
+            logger.info(f"\nCancelled tracks:")
+            for track in cancelled_tracks:
+                logger.info(f"  - {track}")
+
+        logger.info(f"{'='*60}")
 
 
 def main():
@@ -402,6 +500,12 @@ def main():
         help='Output directory (default: downloads)'
     )
     parser.add_argument(
+        '-w', '--workers',
+        type=int,
+        default=3,
+        help='Number of parallel download workers (default: 3)'
+    )
+    parser.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose logging'
@@ -414,7 +518,7 @@ def main():
 
     try:
         downloader = MusicDownloader(output_dir=args.output)
-        downloader.process_url(args.url)
+        downloader.process_url(args.url, max_workers=args.workers)
     except KeyboardInterrupt:
         logger.info("\nOperation cancelled by user")
         sys.exit(1)
